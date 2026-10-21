@@ -51,7 +51,11 @@ async def get_async(session: aiohttp.ClientSession, url: str) -> aiohttp.ClientR
     return response
 
 
-@retry(reraise=True, stop=stop_after_attempt(3))
+@retry(
+    reraise=True,
+    stop=stop_after_attempt(5),
+    wait=wait_random(1, 5),
+)
 async def download_burst_url_async(session: aiohttp.ClientSession, url: str, file_path: Path) -> None:
     """Retry a burst URL GET request until a non-202 response is received, then download the file.
 
@@ -60,6 +64,7 @@ async def download_burst_url_async(session: aiohttp.ClientSession, url: str, fil
         url: The URL to download
         file_path: The path to save the downloaded data to
     """
+
     response = await get_async(session, url)
     assert response.content_disposition is not None
     if file_path.suffix in ['.tif', '.tiff']:
@@ -94,15 +99,35 @@ async def download_bursts_async(url_dict: dict) -> None:
     """
     auth_type = check_earthdata_credentials(append=True)
     headers = {'Authorization': f'Bearer {os.getenv(TOKEN_ENV_VAR)}'} if auth_type == 'token' else {}
-    async with aiohttp.ClientSession(headers=headers, trust_env=True) as session:
+
+    timeout = aiohttp.ClientTimeout(
+        total=None,
+        connect=60,
+        sock_connect=60,
+        sock_read=180,
+    )
+
+    semaphore = asyncio.Semaphore(6)
+
+    async with aiohttp.ClientSession(
+        headers=headers,
+        trust_env=True,
+        timeout=timeout,
+    ) as session:
         # FIXME: once burst extractor API supports EDL tokens this cookie request can be skipped when auth_type='token'
         cookie_response = await session.get(COOKIE_URL)
         cookie_response.raise_for_status()
         cookie_response.close()
 
-        tasks = []
-        for file_path, url in url_dict.items():
-            tasks.append(download_burst_url_async(session, url, file_path))
+        async def limited_download(file_path: Path, url: str) -> None:
+            async with semaphore:
+                await download_burst_url_async(session, url, file_path)
+
+        tasks = [
+            limited_download(file_path, url)
+            for file_path, url in url_dict.items()
+        ]
+
         await asyncio.gather(*tasks)
 
 
@@ -115,6 +140,6 @@ def download_bursts(burst_infos: Iterable[BurstInfo]) -> None:
     url_dict = get_url_dict(burst_infos)
     asyncio.run(download_bursts_async(url_dict))
     full_dict = get_url_dict(burst_infos, force=True)
-    missing_data = [x for x in full_dict.keys() if not x.exists]
+    missing_data = [x for x in full_dict.keys() if not x.exists()]
     if missing_data:
         raise ValueError(f'Error downloading, missing files: {", ".join([x.name for x in missing_data])}')
